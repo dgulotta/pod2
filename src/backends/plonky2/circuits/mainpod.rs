@@ -583,7 +583,7 @@ mod tests {
         for (merkle_proof_target, merkle_proof) in
             merkle_proofs_target.iter().zip(merkle_proofs.iter())
         {
-            merkle_proof_target.set_targets(&mut pw, true, &merkle_proof)?
+            merkle_proof_target.set_targets(&mut pw, true, merkle_proof)?
         }
 
         // generate & verify proof
