@@ -7,9 +7,9 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::middleware::{
-    self, check_st_tmpl, hash_str, AnchoredKey, Key, MainPodInputs, NativeOperation,
-    NativePredicate, OperationAux, OperationType, Params, PodId, PodProver, PodSigner, Predicate,
-    Statement, StatementArg, Value, WildcardValue, EMPTY_VALUE, KEY_TYPE, SELF,
+    self, check_st_tmpl, hash_str, hash_values, AnchoredKey, Hash, Key, MainPodInputs,
+    NativeOperation, NativePredicate, OperationAux, OperationType, Params, PodId, PodProver,
+    PodSigner, Predicate, Statement, StatementArg, Value, WildcardValue, KEY_TYPE, SELF,
 };
 
 mod custom;
@@ -234,6 +234,8 @@ impl MainPodBuilder {
 
     /// Lower syntactic sugar operation into backend compatible operation.
     /// - {Dict,Array,Set}Contains/NotContains becomes Contains/NotContains.
+    /// - GtEqFromEntries/GtFromEntries/GtToNotEqual becomes
+    ///   LtEqFromEntries/LtFromEntries/LtToNotEqual.
     fn lower_op(op: Operation) -> Operation {
         use NativeOperation::*;
         use OperationType::*;
@@ -248,8 +250,11 @@ impl MainPodBuilder {
             }
             Native(SetContainsFromEntries) => {
                 let [set, value] = op.1.try_into().unwrap(); // TODO: Error handling
-                let empty = OperationArg::Literal(Value::from(EMPTY_VALUE));
-                Operation(Native(ContainsFromEntries), vec![set, value, empty], op.2)
+                Operation(
+                    Native(ContainsFromEntries),
+                    vec![set, value.clone(), value],
+                    op.2,
+                )
             }
             Native(SetNotContainsFromEntries) => {
                 let [set, value] = op.1.try_into().unwrap(); // TODO: Error handling
@@ -259,6 +264,15 @@ impl MainPodBuilder {
                 let [array, index, value] = op.1.try_into().unwrap(); // TODO: Error handling
                 Operation(Native(ContainsFromEntries), vec![array, index, value], op.2)
             }
+            Native(GtEqFromEntries) => {
+                let [entry1, entry2] = op.1.try_into().unwrap(); // TODO: Error handling
+                Operation(Native(LtEqFromEntries), vec![entry2, entry1], op.2)
+            }
+            Native(GtFromEntries) => {
+                let [entry1, entry2] = op.1.try_into().unwrap(); // TODO: Error handling
+                Operation(Native(LtFromEntries), vec![entry2, entry1], op.2)
+            }
+            Native(GtToNotEqual) => Operation(Native(LtToNotEqual), op.1, op.2),
             _ => op,
         }
     }
@@ -315,17 +329,14 @@ impl MainPodBuilder {
         let st_args: Vec<StatementArg> = match op_type {
             OperationType::Native(o) => match o {
                 None => vec![],
-                NewEntry => self.op_args_entries(public, args)?,
+                NewEntry | EqualFromEntries | NotEqualFromEntries | LtFromEntries
+                | LtEqFromEntries => self.op_args_entries(public, args)?,
                 CopyStatement => match &args[0] {
                     OperationArg::Statement(s) => s.args().clone(),
                     _ => {
                         return Err(Error::op_invalid_args("copy".to_string()));
                     }
                 },
-                EqualFromEntries => self.op_args_entries(public, args)?,
-                NotEqualFromEntries => self.op_args_entries(public, args)?,
-                GtFromEntries => self.op_args_entries(public, args)?,
-                LtFromEntries => self.op_args_entries(public, args)?,
                 TransitiveEqualFromStatements => {
                     match (args[0].clone(), args[1].clone()) {
                         (
@@ -350,14 +361,6 @@ impl MainPodBuilder {
                         }
                     }
                 }
-                GtToNotEqual => match args[0].clone() {
-                    OperationArg::Statement(Statement::Gt(ak0, ak1)) => {
-                        vec![StatementArg::Key(ak0), StatementArg::Key(ak1)]
-                    }
-                    _ => {
-                        return Err(Error::op_invalid_args("gt-to-neq".to_string()));
-                    }
-                },
                 LtToNotEqual => match args[0].clone() {
                     OperationArg::Statement(Statement::Lt(ak0, ak1)) => {
                         vec![StatementArg::Key(ak0), StatementArg::Key(ak1)]
@@ -435,18 +438,35 @@ impl MainPodBuilder {
                         return Err(Error::op_invalid_args("max-of".to_string()));
                     }
                 },
+                HashOf => match (args[0].clone(), args[1].clone(), args[2].clone()) {
+                    (
+                        OperationArg::Statement(Statement::ValueOf(ak0, v0)),
+                        OperationArg::Statement(Statement::ValueOf(ak1, v1)),
+                        OperationArg::Statement(Statement::ValueOf(ak2, v2)),
+                    ) => {
+                        if Hash::from(v0.raw()) == hash_values(&[v1, v2]) {
+                            vec![
+                                StatementArg::Key(ak0),
+                                StatementArg::Key(ak1),
+                                StatementArg::Key(ak2),
+                            ]
+                        } else {
+                            return Err(Error::op_invalid_args("hash-of".to_string()));
+                        }
+                    }
+                    _ => {
+                        return Err(Error::op_invalid_args("hash-of".to_string()));
+                    }
+                },
                 ContainsFromEntries => self.op_args_entries(public, args)?,
                 NotContainsFromEntries => self.op_args_entries(public, args)?,
-                // NOTE: Could we remove these and assume that this function is never called with
-                // syntax sugar operations?
-                DictContainsFromEntries => self.op_args_entries(public, args)?,
-                DictNotContainsFromEntries => self.op_args_entries(public, args)?,
-                SetContainsFromEntries => self.op_args_entries(public, args)?,
-                SetNotContainsFromEntries => self.op_args_entries(public, args)?,
-                ArrayContainsFromEntries => self.op_args_entries(public, args)?,
+                _ => Err(Error::custom(format!(
+                    "Unexpected syntactic sugar: {:?}",
+                    op_type
+                )))?,
             },
             OperationType::Custom(cpr) => {
-                let pred = &cpr.batch.predicates[cpr.index];
+                let pred = &cpr.batch.predicates()[cpr.index];
                 if pred.statements.len() != args.len() {
                     return Err(Error::custom(format!(
                         "Custom predicate operation needs {} statements but has {}.",

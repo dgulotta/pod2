@@ -1,4 +1,4 @@
-use std::{fmt, iter, sync::Arc};
+use std::{fmt, iter};
 
 use log::error;
 use plonky2::field::types::Field;
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     backends::plonky2::primitives::merkletree::MerkleProof,
     middleware::{
-        custom::KeyOrWildcard, AnchoredKey, CustomPredicateBatch, CustomPredicateRef, Error,
+        custom::KeyOrWildcard, AnchoredKey, CustomPredicate, CustomPredicateRef, Error,
         NativePredicate, Params, Predicate, Result, Statement, StatementArg, StatementTmplArg,
         ToFields, Wildcard, WildcardValue, F, SELF,
     },
@@ -36,6 +36,9 @@ impl fmt::Display for OperationAux {
 }
 
 impl ToFields for OperationType {
+    /// Encoding:
+    /// - Native(native_op) => [1, [native_op], 0, 0, 0, 0]
+    /// - Custom(batch, index) => [3, [batch.id], index]
     fn to_fields(&self, params: &Params) -> Vec<F> {
         let mut fields: Vec<F> = match self {
             Self::Native(p) => iter::once(F::from_canonical_u64(1))
@@ -43,7 +46,7 @@ impl ToFields for OperationType {
                 .collect(),
             Self::Custom(CustomPredicateRef { batch, index }) => {
                 iter::once(F::from_canonical_u64(3))
-                    .chain(batch.hash(params).0)
+                    .chain(batch.id().0)
                     .chain(iter::once(F::from_canonical_usize(*index)))
                     .collect()
             }
@@ -60,16 +63,16 @@ pub enum NativeOperation {
     CopyStatement = 2,
     EqualFromEntries = 3,
     NotEqualFromEntries = 4,
-    GtFromEntries = 5,
+    LtEqFromEntries = 5,
     LtFromEntries = 6,
     TransitiveEqualFromStatements = 7,
-    GtToNotEqual = 8,
-    LtToNotEqual = 9,
-    ContainsFromEntries = 10,
-    NotContainsFromEntries = 11,
-    SumOf = 13,
-    ProductOf = 14,
-    MaxOf = 15,
+    LtToNotEqual = 8,
+    ContainsFromEntries = 9,
+    NotContainsFromEntries = 10,
+    SumOf = 11,
+    ProductOf = 12,
+    MaxOf = 13,
+    HashOf = 14,
 
     // Syntactic sugar operations.  These operations are not supported by the backend.  The
     // frontend compiler is responsible of translating these operations into the operations above.
@@ -78,6 +81,9 @@ pub enum NativeOperation {
     SetContainsFromEntries = 1003,
     SetNotContainsFromEntries = 1004,
     ArrayContainsFromEntries = 1005,
+    GtEqFromEntries = 1006,
+    GtFromEntries = 1007,
+    GtToNotEqual = 1008,
 }
 
 impl ToFields for NativeOperation {
@@ -102,12 +108,11 @@ impl OperationType {
                 NativeOperation::NotEqualFromEntries => {
                     Some(Predicate::Native(NativePredicate::NotEqual))
                 }
-                NativeOperation::GtFromEntries => Some(Predicate::Native(NativePredicate::Gt)),
+                NativeOperation::LtEqFromEntries => Some(Predicate::Native(NativePredicate::LtEq)),
                 NativeOperation::LtFromEntries => Some(Predicate::Native(NativePredicate::Lt)),
                 NativeOperation::TransitiveEqualFromStatements => {
                     Some(Predicate::Native(NativePredicate::Equal))
                 }
-                NativeOperation::GtToNotEqual => Some(Predicate::Native(NativePredicate::NotEqual)),
                 NativeOperation::LtToNotEqual => Some(Predicate::Native(NativePredicate::NotEqual)),
                 NativeOperation::ContainsFromEntries => {
                     Some(Predicate::Native(NativePredicate::Contains))
@@ -118,6 +123,7 @@ impl OperationType {
                 NativeOperation::SumOf => Some(Predicate::Native(NativePredicate::SumOf)),
                 NativeOperation::ProductOf => Some(Predicate::Native(NativePredicate::ProductOf)),
                 NativeOperation::MaxOf => Some(Predicate::Native(NativePredicate::MaxOf)),
+                NativeOperation::HashOf => Some(Predicate::Native(NativePredicate::HashOf)),
                 no => unreachable!("Unexpected syntactic sugar op {:?}", no),
             },
             OperationType::Custom(cpr) => Some(Predicate::Custom(cpr.clone())),
@@ -133,10 +139,9 @@ pub enum Operation {
     CopyStatement(Statement),
     EqualFromEntries(Statement, Statement),
     NotEqualFromEntries(Statement, Statement),
-    GtFromEntries(Statement, Statement),
+    LtEqFromEntries(Statement, Statement),
     LtFromEntries(Statement, Statement),
     TransitiveEqualFromStatements(Statement, Statement),
-    GtToNotEqual(Statement),
     LtToNotEqual(Statement),
     ContainsFromEntries(
         /* root  */ Statement,
@@ -152,6 +157,7 @@ pub enum Operation {
     SumOf(Statement, Statement, Statement),
     ProductOf(Statement, Statement, Statement),
     MaxOf(Statement, Statement, Statement),
+    HashOf(Statement, Statement, Statement),
     Custom(CustomPredicateRef, Vec<Statement>),
 }
 
@@ -165,16 +171,16 @@ impl Operation {
             Self::CopyStatement(_) => OT::Native(CopyStatement),
             Self::EqualFromEntries(_, _) => OT::Native(EqualFromEntries),
             Self::NotEqualFromEntries(_, _) => OT::Native(NotEqualFromEntries),
-            Self::GtFromEntries(_, _) => OT::Native(GtFromEntries),
+            Self::LtEqFromEntries(_, _) => OT::Native(LtEqFromEntries),
             Self::LtFromEntries(_, _) => OT::Native(LtFromEntries),
             Self::TransitiveEqualFromStatements(_, _) => OT::Native(TransitiveEqualFromStatements),
-            Self::GtToNotEqual(_) => OT::Native(GtToNotEqual),
             Self::LtToNotEqual(_) => OT::Native(LtToNotEqual),
             Self::ContainsFromEntries(_, _, _, _) => OT::Native(ContainsFromEntries),
             Self::NotContainsFromEntries(_, _, _) => OT::Native(NotContainsFromEntries),
             Self::SumOf(_, _, _) => OT::Native(SumOf),
             Self::ProductOf(_, _, _) => OT::Native(ProductOf),
             Self::MaxOf(_, _, _) => OT::Native(MaxOf),
+            Self::HashOf(_, _, _) => OT::Native(HashOf),
             Self::Custom(cpr, _) => OT::Custom(cpr.clone()),
         }
     }
@@ -186,16 +192,16 @@ impl Operation {
             Self::CopyStatement(s) => vec![s],
             Self::EqualFromEntries(s1, s2) => vec![s1, s2],
             Self::NotEqualFromEntries(s1, s2) => vec![s1, s2],
-            Self::GtFromEntries(s1, s2) => vec![s1, s2],
+            Self::LtEqFromEntries(s1, s2) => vec![s1, s2],
             Self::LtFromEntries(s1, s2) => vec![s1, s2],
             Self::TransitiveEqualFromStatements(s1, s2) => vec![s1, s2],
-            Self::GtToNotEqual(s) => vec![s],
             Self::LtToNotEqual(s) => vec![s],
             Self::ContainsFromEntries(s1, s2, s3, _pf) => vec![s1, s2, s3],
             Self::NotContainsFromEntries(s1, s2, _pf) => vec![s1, s2],
             Self::SumOf(s1, s2, s3) => vec![s1, s2, s3],
             Self::ProductOf(s1, s2, s3) => vec![s1, s2, s3],
             Self::MaxOf(s1, s2, s3) => vec![s1, s2, s3],
+            Self::HashOf(s1, s2, s3) => vec![s1, s2, s3],
             Self::Custom(_, args) => args,
         }
     }
@@ -229,8 +235,8 @@ impl Operation {
                 (NO::NotEqualFromEntries, (Some(s1), Some(s2), None), OA::None, 2) => {
                     Self::NotEqualFromEntries(s1, s2)
                 }
-                (NO::GtFromEntries, (Some(s1), Some(s2), None), OA::None, 2) => {
-                    Self::GtFromEntries(s1, s2)
+                (NO::LtEqFromEntries, (Some(s1), Some(s2), None), OA::None, 2) => {
+                    Self::LtEqFromEntries(s1, s2)
                 }
                 (NO::LtFromEntries, (Some(s1), Some(s2), None), OA::None, 2) => {
                     Self::LtFromEntries(s1, s2)
@@ -252,6 +258,9 @@ impl Operation {
                     Self::ProductOf(s1, s2, s3)
                 }
                 (NO::MaxOf, (Some(s1), Some(s2), Some(s3)), OA::None, 3) => Self::MaxOf(s1, s2, s3),
+                (NO::HashOf, (Some(s1), Some(s2), Some(s3)), OA::None, 3) => {
+                    Self::HashOf(s1, s2, s3)
+                }
                 _ => Err(Error::custom(format!(
                     "Ill-formed operation {:?} with arguments {:?}.",
                     op_code, args
@@ -282,8 +291,8 @@ impl Operation {
             (Self::NotEqualFromEntries(ValueOf(ak1, v1), ValueOf(ak2, v2)), NotEqual(ak3, ak4)) => {
                 Ok(v1 != v2 && ak3 == ak1 && ak4 == ak2)
             }
-            (Self::GtFromEntries(ValueOf(ak1, v1), ValueOf(ak2, v2)), Gt(ak3, ak4)) => {
-                Ok(v1 > v2 && ak3 == ak1 && ak4 == ak2)
+            (Self::LtEqFromEntries(ValueOf(ak1, v1), ValueOf(ak2, v2)), LtEq(ak3, ak4)) => {
+                Ok(v1 <= v2 && ak3 == ak1 && ak4 == ak2)
             }
             (Self::LtFromEntries(ValueOf(ak1, v1), ValueOf(ak2, v2)), Lt(ak3, ak4)) => {
                 Ok(v1 < v2 && ak3 == ak1 && ak4 == ak2)
@@ -302,7 +311,6 @@ impl Operation {
                 Self::TransitiveEqualFromStatements(Equal(ak1, ak2), Equal(ak3, ak4)),
                 Equal(ak5, ak6),
             ) => Ok(ak2 == ak3 && ak5 == ak1 && ak6 == ak4),
-            (Self::GtToNotEqual(Gt(ak1, ak2)), NotEqual(ak3, ak4)) => Ok(ak1 == ak3 && ak2 == ak4),
             (Self::LtToNotEqual(Lt(ak1, ak2)), NotEqual(ak3, ak4)) => Ok(ak1 == ak3 && ak2 == ak4),
             (
                 Self::SumOf(ValueOf(ak1, v1), ValueOf(ak2, v2), ValueOf(ak3, v3)),
@@ -316,7 +324,7 @@ impl Operation {
             (Self::Custom(CustomPredicateRef { batch, index }, args), Custom(cpr, s_args))
                 if batch == &cpr.batch && index == &cpr.index =>
             {
-                check_custom_pred(params, batch, *index, args, s_args)
+                check_custom_pred(params, cpr, args, s_args)
             }
             _ => Err(Error::invalid_deduction(
                 self.clone(),
@@ -355,7 +363,7 @@ pub fn check_st_tmpl(
         (StatementTmplArg::None, StatementArg::None) => true,
         (StatementTmplArg::Literal(lhs), StatementArg::Literal(rhs)) if lhs == rhs => true,
         (
-            StatementTmplArg::Key(pod_id_wc, key_or_wc),
+            StatementTmplArg::AnchoredKey(pod_id_wc, key_or_wc),
             StatementArg::Key(AnchoredKey { pod_id, key }),
         ) => {
             let pod_id_ok = check_or_set(WildcardValue::PodId(*pod_id), pod_id_wc, wildcard_map);
@@ -374,14 +382,46 @@ pub fn check_st_tmpl(
     }
 }
 
+pub fn resolve_wildcard_values(
+    params: &Params,
+    pred: &CustomPredicate,
+    args: &[Statement],
+) -> Option<Vec<WildcardValue>> {
+    // Check that all wildcard have consistent values as assigned in the statements while storing a
+    // map of their values.
+    // NOTE: We assume the statements have the same order as defined in the custom predicate.  For
+    // disjunctions we expect Statement::None for the unused statements.
+    let mut wildcard_map = vec![None; params.max_custom_predicate_wildcards];
+    for (st_tmpl, st) in pred.statements.iter().zip(args) {
+        let st_args = st.args();
+        for (st_tmpl_arg, st_arg) in st_tmpl.args.iter().zip(&st_args) {
+            if !check_st_tmpl(st_tmpl_arg, st_arg, &mut wildcard_map) {
+                // TODO: Better errors.  Example:
+                // println!("{} doesn't match {}", st_arg, st_tmpl_arg);
+                // println!("{} doesn't match {}", st, st_tmpl);
+                return None;
+            }
+        }
+    }
+
+    // NOTE: We set unresolved wildcard slots with an empty value.  They can be unresolved because
+    // they are beyond the number of used wildcards in this custom predicate, or they could be
+    // private arguments that are unused in a particular disjunction.
+    Some(
+        wildcard_map
+            .into_iter()
+            .map(|opt| opt.unwrap_or(WildcardValue::None))
+            .collect(),
+    )
+}
+
 fn check_custom_pred(
     params: &Params,
-    batch: &Arc<CustomPredicateBatch>,
-    index: usize,
+    custom_pred_ref: &CustomPredicateRef,
     args: &[Statement],
     s_args: &[WildcardValue],
 ) -> Result<bool> {
-    let pred = &batch.predicates[index];
+    let pred = custom_pred_ref.predicate();
     if pred.statements.len() != args.len() {
         return Err(Error::diff_amount(
             "custom predicate operation".to_string(),
@@ -399,26 +439,12 @@ fn check_custom_pred(
         ));
     }
 
-    // Check that all wildcard have consistent values as assigned in the statements while storing a
-    // map of their values.  Count the number of statements that match the templates by predicate.
-    // NOTE: We assume the statements have the same order as defined in the custom predicate.  For
-    // disjunctions we expect Statement::None for the unused statements.
+    // Count the number of statements that match the templates by predicate.
     let mut num_matches = 0;
-    let mut wildcard_map = vec![None; params.max_custom_predicate_wildcards];
     for (st_tmpl, st) in pred.statements.iter().zip(args) {
-        let st_args = st.args();
-        for (st_tmpl_arg, st_arg) in st_tmpl.args.iter().zip(&st_args) {
-            if !check_st_tmpl(st_tmpl_arg, st_arg, &mut wildcard_map) {
-                // TODO: Better errors.  Example:
-                // println!("{} doesn't match {}", st_arg, st_tmpl_arg);
-                // println!("{} doesn't match {}", st, st_tmpl);
-                return Ok(false);
-            }
-        }
-
         let st_tmpl_pred = match &st_tmpl.pred {
             Predicate::BatchSelf(i) => Predicate::Custom(CustomPredicateRef {
-                batch: batch.clone(),
+                batch: custom_pred_ref.batch.clone(),
                 index: *i,
             }),
             p => p.clone(),
@@ -428,9 +454,14 @@ fn check_custom_pred(
         }
     }
 
+    let wildcard_map = match resolve_wildcard_values(params, pred, args) {
+        Some(wc_map) => wc_map,
+        None => return Ok(false),
+    };
+
     // Check that the resolved wildcard match the statement arguments.
     for (s_arg, wc_value) in s_args.iter().zip(wildcard_map.iter()) {
-        if !wc_value.as_ref().is_none_or(|wc_value| *wc_value == *s_arg) {
+        if *wc_value != *s_arg {
             return Ok(false);
         }
     }
