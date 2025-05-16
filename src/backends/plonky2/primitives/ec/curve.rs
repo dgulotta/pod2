@@ -12,22 +12,33 @@ use plonky2::{
         ops::Square,
         types::Field,
     },
+    hash::poseidon::PoseidonHash,
     iop::{generator::SimpleGenerator, target::BoolTarget, witness::WitnessWrite},
     plonk::circuit_builder::CircuitBuilder,
     util::serialization::{Read, Write},
 };
+use serde::{Deserialize, Serialize};
 
-use crate::backends::plonky2::primitives::ec::{
-    bits::BigUInt320Target,
-    field::{get_nnf_target, CircuitBuilderNNF, OEFTarget},
+use crate::backends::plonky2::{
+    circuits::common::ValueTarget,
+    primitives::ec::{
+        bits::BigUInt320Target,
+        field::{get_nnf_target, CircuitBuilderNNF, OEFTarget},
+    },
 };
 
 type ECField = QuinticExtension<GoldilocksField>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Point {
     pub x: ECField,
     pub u: ECField,
+}
+
+impl Point {
+    pub fn as_fields(&self) -> Vec<crate::middleware::F> {
+        self.x.0.iter().chain(self.u.0.iter()).cloned().collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -200,6 +211,21 @@ type FieldTarget = OEFTarget<5, QuinticExtension<GoldilocksField>>;
 pub struct PointTarget {
     pub x: FieldTarget,
     pub u: FieldTarget,
+}
+
+impl PointTarget {
+    pub fn to_value(&self, builder: &mut CircuitBuilder<GoldilocksField, 2>) -> ValueTarget {
+        let hash = builder.hash_n_to_m_no_pad::<PoseidonHash>(
+            self.x
+                .components
+                .iter()
+                .chain(self.u.components.iter())
+                .cloned()
+                .collect(),
+            4,
+        );
+        ValueTarget::from_slice(&hash)
+    }
 }
 
 #[derive(Clone, Debug)]

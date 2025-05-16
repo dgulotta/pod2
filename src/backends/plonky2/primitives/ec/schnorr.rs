@@ -1,6 +1,7 @@
 use std::array;
 
 use num::BigUint;
+use num_bigint::RandBigInt;
 use plonky2::{
     field::{
         extension::FieldExtension,
@@ -12,24 +13,121 @@ use plonky2::{
         hashing::hash_n_to_m_no_pad,
         poseidon::{PoseidonHash, PoseidonPermutation},
     },
-    iop::target::Target,
+    iop::{
+        target::{BoolTarget, Target},
+        witness::WitnessWrite,
+    },
     plonk::circuit_builder::CircuitBuilder,
 };
+use rand::rngs::OsRng;
 
 use super::curve::Point;
 use crate::{
-    backends::plonky2::primitives::ec::{
-        bits::{BigUInt320Target, CircuitBuilderBits},
-        curve::{CircuitBuilderElliptic, PointTarget, GROUP_ORDER},
+    backends::plonky2::{
+        circuits::common::CircuitBuilderPod,
+        primitives::ec::{
+            bits::{BigUInt320Target, CircuitBuilderBits},
+            curve::{CircuitBuilderElliptic, PointTarget, WitnessWriteCurve, GROUP_ORDER},
+        },
     },
     middleware::RawValue,
 };
 
-pub fn make_public_key(private_key: &BigUint) -> Point {
-    private_key * Point::generator().inverse()
+/// Schnorr signature over ecGFp5.
+#[derive(Clone, Debug)]
+pub struct Signature {
+    pub s: BigUint,
+    pub e: BigUint,
 }
 
-fn hash_array(values: &[GoldilocksField; 9]) -> [GoldilocksField; 5] {
+impl Signature {
+    pub fn verify(&self, public_key: Point, msg: RawValue) -> bool {
+        let r = &self.s * Point::generator() + &self.e * public_key;
+        let e = convert_hash_to_biguint(&hash(msg, r));
+        e == self.e
+    }
+}
+
+/// Targets for Schnorr signature over ecGFp5.
+#[derive(Clone, Debug)]
+pub struct SignatureTarget {
+    pub s: BigUInt320Target,
+    pub e: BigUInt320Target,
+}
+
+pub trait CircuitBuilderSchnorr {
+    fn add_schnorr_signature_target(&mut self) -> SignatureTarget;
+}
+
+impl CircuitBuilderSchnorr for CircuitBuilder<GoldilocksField, 2> {
+    fn add_schnorr_signature_target(&mut self) -> SignatureTarget {
+        SignatureTarget {
+            s: self.add_virtual_biguint320_target(),
+            e: self.add_virtual_biguint320_target(),
+        }
+    }
+}
+
+pub trait WitnessWriteSchnorr: WitnessWrite<GoldilocksField> + WitnessWriteCurve {
+    fn set_signature_target(
+        &mut self,
+        target: &SignatureTarget,
+        value: &Signature,
+    ) -> anyhow::Result<()> {
+        self.set_biguint320_target(&target.s, &value.s)?;
+        self.set_biguint320_target(&target.e, &value.e)
+    }
+}
+
+impl<W: WitnessWrite<GoldilocksField>> WitnessWriteSchnorr for W {}
+
+impl SignatureTarget {
+    pub fn verify(
+        &self,
+        builder: &mut CircuitBuilder<GoldilocksField, 2>,
+        msg: HashOutTarget,
+        public_key: &PointTarget,
+    ) -> BoolTarget {
+        let g = builder.constant_point(Point::generator());
+        let sig1_bits = builder.biguint_bits(&self.s);
+        let sig2_bits = builder.biguint_bits(&self.e);
+        let r = builder.linear_combination_points(&sig1_bits, &sig2_bits, &g, public_key);
+        let u_arr = r.u.components;
+        let inputs = u_arr.into_iter().chain(msg.elements).collect::<Vec<_>>();
+        let e_hash = hash_array_circuit(builder, &inputs);
+        let e = builder.field_elements_to_biguint(&e_hash);
+        builder.is_equal_slice(&self.e.0, &e.0)
+    }
+}
+
+pub struct SecretKey(pub BigUint);
+
+impl SecretKey {
+    pub fn new_rand() -> Self {
+        Self(OsRng.gen_biguint_below(&GROUP_ORDER))
+    }
+    pub fn public_key(&self) -> Point {
+        &self.0 * Point::generator().inverse()
+    }
+
+    pub fn sign(&self, msg: RawValue, nonce: &BigUint) -> Signature {
+        let r = nonce * Point::generator();
+        let e = convert_hash_to_biguint(&hash(msg, r));
+        let s = (nonce + &self.0 * &e) % &*GROUP_ORDER;
+        Signature { s, e }
+    }
+}
+
+impl SignatureTarget {
+    pub fn add_virtual_target(builder: &mut CircuitBuilder<GoldilocksField, 2>) -> Self {
+        Self {
+            s: builder.add_virtual_biguint320_target(),
+            e: builder.add_virtual_biguint320_target(),
+        }
+    }
+}
+
+fn hash_array(values: &[GoldilocksField]) -> [GoldilocksField; 5] {
     let hash = hash_n_to_m_no_pad::<_, PoseidonPermutation<_>>(values, 5);
     std::array::from_fn(|i| hash[i])
 }
@@ -39,9 +137,7 @@ fn hash(msg: RawValue, point: Point) -> [GoldilocksField; 5] {
     // CircuitBuilderEllptic::connect_point.  So we don't need to hash the
     // x-coordinate.
     let u_arr: [GoldilocksField; 5] = point.u.to_basefield_array();
-    let values = [
-        u_arr[0], u_arr[1], u_arr[2], u_arr[3], u_arr[4], msg.0[0], msg.0[1], msg.0[2], msg.0[3],
-    ];
+    let values: Vec<_> = u_arr.into_iter().chain(msg.0).collect();
     hash_array(&values)
 }
 
@@ -54,59 +150,17 @@ fn convert_hash_to_biguint(hash: &[GoldilocksField; 5]) -> BigUint {
     ans
 }
 
-pub fn sign(msg: RawValue, private_key: &BigUint, nonce: &BigUint) -> (BigUint, BigUint) {
-    let r = nonce * Point::generator();
-    let e = convert_hash_to_biguint(&hash(msg, r));
-    let s = (nonce + private_key * &e) % &*GROUP_ORDER;
-    (s, e)
-}
-
-pub fn verify_signature(msg: RawValue, public_key: Point, sig1: &BigUint, sig2: &BigUint) -> bool {
-    let r = sig1 * Point::generator() + sig2 * public_key;
-    let e = convert_hash_to_biguint(&hash(msg, r));
-    &e == sig2
-}
-
 fn hash_array_circuit(
     builder: &mut CircuitBuilder<GoldilocksField, 2>,
-    inputs: &[Target; 9],
+    inputs: &[Target],
 ) -> [Target; 5] {
-    let input_vec = inputs.as_slice().to_owned();
+    let input_vec = inputs.to_owned();
     let hash = builder.hash_n_to_m_no_pad::<PoseidonHash>(input_vec, 5);
     array::from_fn(|i| hash[i])
 }
 
-pub fn verify_signature_circuit(
-    builder: &mut CircuitBuilder<GoldilocksField, 2>,
-    msg: HashOutTarget,
-    public_key: &PointTarget,
-    sig1: &BigUInt320Target,
-    sig2: &BigUInt320Target,
-) {
-    let g = builder.constant_point(Point::generator());
-    let sig1_bits = builder.biguint_bits(sig1);
-    let sig2_bits = builder.biguint_bits(sig2);
-    let r = builder.linear_combination_points(&sig1_bits, &sig2_bits, &g, public_key);
-    let u_arr = r.u.components;
-    let inputs = [
-        u_arr[0],
-        u_arr[1],
-        u_arr[2],
-        u_arr[3],
-        u_arr[4],
-        msg.elements[0],
-        msg.elements[1],
-        msg.elements[2],
-        msg.elements[3],
-    ];
-    let e_hash = hash_array_circuit(builder, &inputs);
-    let e = builder.field_elements_to_biguint(&e_hash);
-    builder.connect_biguint320(sig2, &e);
-}
-
 #[cfg(test)]
 mod test {
-    use num::BigUint;
     use num_bigint::RandBigInt;
     use plonky2::{
         field::{goldilocks_field::GoldilocksField, types::Sample},
@@ -126,56 +180,60 @@ mod test {
             bits::CircuitBuilderBits,
             curve::{CircuitBuilderElliptic, Point, WitnessWriteCurve, GROUP_ORDER},
             schnorr::{
-                convert_hash_to_biguint, hash_array, hash_array_circuit, make_public_key, sign,
-                verify_signature, verify_signature_circuit,
+                convert_hash_to_biguint, hash_array, hash_array_circuit, SecretKey, Signature,
+                SignatureTarget,
             },
         },
         middleware::RawValue,
     };
 
-    fn gen_signed_message() -> (Point, RawValue, BigUint, BigUint) {
+    fn gen_signed_message() -> (Point, RawValue, Signature) {
         let msg = RawValue(GoldilocksField::rand_array());
-        let private_key = OsRng.gen_biguint_below(&GROUP_ORDER);
+        let private_key = SecretKey(OsRng.gen_biguint_below(&GROUP_ORDER));
         let nonce = OsRng.gen_biguint_below(&GROUP_ORDER);
-        let public_key = make_public_key(&private_key);
-        let (sig1, sig2) = sign(msg, &private_key, &nonce);
-        (public_key, msg, sig1, sig2)
+        let public_key = private_key.public_key();
+        let sig = private_key.sign(msg, &nonce);
+        (public_key, msg, sig)
     }
 
     #[test]
     fn test_verify_signature() {
-        let (public_key, msg, sig1, sig2) = gen_signed_message();
-        assert!(&sig1 < &GROUP_ORDER);
-        assert!(verify_signature(msg, public_key, &sig1, &sig2));
+        let (public_key, msg, sig) = gen_signed_message();
+        assert!(&sig.s < &GROUP_ORDER);
+        assert!(sig.verify(public_key, msg));
     }
 
     #[test]
     fn test_reject_bogus_signature() {
         let msg = RawValue(GoldilocksField::rand_array());
-        let private_key = OsRng.gen_biguint_below(&GROUP_ORDER);
+        let private_key = SecretKey(OsRng.gen_biguint_below(&GROUP_ORDER));
         let nonce = OsRng.gen_biguint_below(&GROUP_ORDER);
-        let public_key = make_public_key(&private_key);
-        let (sig1, sig2) = sign(msg, &private_key, &nonce);
+        let public_key = private_key.public_key();
+        let sig = private_key.sign(msg, &nonce);
         let junk = OsRng.gen_biguint_below(&GROUP_ORDER);
-        assert!(!verify_signature(msg, public_key, &sig1, &junk));
-        assert!(!verify_signature(msg, public_key, &junk, &sig2));
+        assert!(!Signature {
+            s: sig.s.clone(),
+            e: junk.clone()
+        }
+        .verify(public_key, msg));
+        assert!(!Signature { s: junk, e: sig.e }.verify(public_key, msg));
     }
 
     #[test]
     fn test_verify_signature_circuit() -> Result<(), anyhow::Error> {
-        let (public_key, msg, sig1, sig2) = gen_signed_message();
+        let (public_key, msg, sig) = gen_signed_message();
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<GoldilocksField, 2>::new(config);
         let key_t = builder.add_virtual_point_target();
         let msg_t = builder.add_virtual_hash();
-        let sig1_t = builder.add_virtual_biguint320_target();
-        let sig2_t = builder.add_virtual_biguint320_target();
-        verify_signature_circuit(&mut builder, msg_t, &key_t, &sig1_t, &sig2_t);
+        let sig_t = SignatureTarget::add_virtual_target(&mut builder);
+        let verified = sig_t.verify(&mut builder, msg_t, &key_t);
+        builder.assert_one(verified.target);
         let mut pw = PartialWitness::new();
         pw.set_point_target(&key_t, &public_key)?;
         pw.set_hash_target(msg_t, msg.0.into())?;
-        pw.set_biguint320_target(&sig1_t, &sig1)?;
-        pw.set_biguint320_target(&sig2_t, &sig2)?;
+        pw.set_biguint320_target(&sig_t.s, &sig.s)?;
+        pw.set_biguint320_target(&sig_t.e, &sig.e)?;
         let data = builder.build::<PoseidonGoldilocksConfig>();
         let proof = data.prove(pw)?;
         data.verify(proof)?;
@@ -184,15 +242,18 @@ mod test {
 
     #[test]
     fn test_reject_bogus_signature_circuit() {
-        let (public_key, msg, sig1, sig2) = gen_signed_message();
+        let (public_key, msg, sig) = gen_signed_message();
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<GoldilocksField, 2>::new(config);
         let key_t = builder.constant_point(public_key);
         let msg_t = builder.constant_hash(msg.0.into());
-        let sig1_t = builder.constant_biguint320(&sig1);
-        let sig2_t = builder.constant_biguint320(&sig2);
-        // sig1 and sig2 are passed out of order
-        verify_signature_circuit(&mut builder, msg_t, &key_t, &sig2_t, &sig1_t);
+        // sig.s and sig.e are passed out of order
+        let sig_t = SignatureTarget {
+            s: builder.constant_biguint320(&sig.e),
+            e: builder.constant_biguint320(&sig.s),
+        };
+        let verified = sig_t.verify(&mut builder, msg_t, &key_t);
+        builder.assert_one(verified.target);
         let pw = PartialWitness::new();
         let data = builder.build::<PoseidonGoldilocksConfig>();
         assert!(data.prove(pw).is_err());
@@ -200,7 +261,7 @@ mod test {
 
     #[test]
     fn test_hash_consistency() -> Result<(), anyhow::Error> {
-        let values = GoldilocksField::rand_array();
+        let values = GoldilocksField::rand_array::<9>();
         let hash = hash_array(&values);
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<GoldilocksField, 2>::new(config);
